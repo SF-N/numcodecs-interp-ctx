@@ -13,6 +13,7 @@ import numcodecs.compat
 import numcodecs.registry
 import numpy as np
 from numcodecs.abc import Codec
+from numcodecs_mask.abc import MaskAwareCodecMixin
 from typing_extensions import Buffer  # MSPV 3.12
 
 from . import _interp
@@ -26,7 +27,7 @@ def _as_slices(shape: tuple[int, ...]) -> tuple[int, int, int]:
     return (reduce(lambda a, b: a * b, shape[:-2], 1), shape[-2], shape[-1])
 
 
-class InterpolationContextMixingCodec(Codec):
+class InterpolationContextMixingCodec(Codec, MaskAwareCodecMixin):
     """
     Lossy codec with a pointwise absolute error bound for smooth gridded data,
     combining hierarchical interpolation prediction with context-mixing
@@ -48,9 +49,12 @@ class InterpolationContextMixingCodec(Codec):
 
     Compared to pixel-wise predictive coding, the two-sided interpolation
     prediction is much more accurate for smooth fields at low bitrates. NaN
-    and infinite values are not supported; combine with a masking meta-codec
-    such as [`numcodecs_mask.MaskMetaCodec`](https://numcodecs-mask.readthedocs.io)
-    to remove them first.
+    and infinite values are not supported unless they are masked: the codec
+    implements the
+    [`MaskAwareCodecMixin`][numcodecs_mask.abc.MaskAwareCodecMixin], so that
+    inside a [`numcodecs_mask.MaskMetaCodec`](https://numcodecs-mask.readthedocs.io)
+    masked values are not coded at all (they take the interpolated
+    prediction, which keeps the field smooth for the neighbouring points).
 
     Parameters
     ----------
@@ -116,16 +120,57 @@ class InterpolationContextMixingCodec(Codec):
             Encoded data as a bytestring.
         """
 
+        return self._encode(buf, None)
+
+    def encode_masked(
+        self, buf: Buffer, mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+    ) -> bytes:
+        """
+        Encode the data in `buf`, ignoring the values where `mask` is
+        [`True`][True] (they are not coded and decode to the interpolated
+        prediction).
+
+        Parameters
+        ----------
+        buf : Buffer
+            Floating-point data to be encoded. May be any object supporting
+            the new-style buffer protocol. The values at masked positions are
+            unspecified.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the data, of
+            the values that do not need to be preserved.
+
+        Returns
+        -------
+        enc : bytes
+            Encoded data as a bytestring.
+        """
+
+        return self._encode(buf, mask)
+
+    def _encode(
+        self,
+        buf: Buffer,
+        mask: None | np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+    ) -> bytes:
         a = numcodecs.compat.ensure_ndarray(buf)
         dtype, shape = a.dtype, a.shape
 
         if not np.issubdtype(dtype, np.floating):
             raise TypeError("can only encode floating point values")
-        if not np.all(np.isfinite(a)):
-            raise ValueError("cannot encode non-finite values, mask them first")
 
         T, Y, X = _as_slices(shape)
+        m: np.ndarray
+        if mask is None:
+            m = np.zeros((T, Y, X), dtype=np.uint8)
+        else:
+            m = np.ascontiguousarray(
+                np.asarray(mask, dtype=np.bool).astype(np.uint8).reshape(T, Y, X)
+            )
         x3 = np.ascontiguousarray(a.astype(np.float64).reshape(T, Y, X))
+        x3[m == 1] = 0.0
+        if not np.all(np.isfinite(x3)):
+            raise ValueError("cannot encode non-finite values, mask them first")
         levels = self._resolve_levels(Y, X)
 
         rec = np.zeros_like(x3)
@@ -138,6 +183,7 @@ class InterpolationContextMixingCodec(Codec):
         for _ in range(16):
             n = _interp.code_all(
                 x3,
+                m,
                 rec,
                 T,
                 Y,
@@ -150,7 +196,7 @@ class InterpolationContextMixingCodec(Codec):
                 self._mixer_rate,
                 self._model_floor,
             )
-            error = np.abs(rec.astype(dtype).astype(np.float64) - x3)
+            error = np.abs(rec.astype(dtype).astype(np.float64) - x3)[m == 0]
             error_max = float(error.max()) if error.size > 0 else 0.0
             if error_max <= self._eb:
                 break
@@ -200,6 +246,44 @@ class InterpolationContextMixingCodec(Codec):
             protocol.
         """
 
+        return self._decode(buf, None, out)
+
+    def decode_masked(
+        self,
+        buf: Buffer,
+        mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: None | Buffer = None,
+    ) -> Buffer:
+        """
+        Decode the data in `buf`, which was encoded with the same `mask`.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Encoded data. Must be an object representing a bytestring, e.g.
+            [`bytes`][bytes] or a 1D array of [`np.uint8`][numpy.uint8]s etc.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the decoded
+            data, that was passed to `encode_masked`.
+        out : Buffer, optional
+            Writeable buffer to store decoded data. N.B. if provided, this
+            buffer must be exactly the right size to store the decoded data.
+
+        Returns
+        -------
+        dec : Buffer
+            Decoded data. May be any object supporting the new-style buffer
+            protocol. The values at masked positions are unspecified.
+        """
+
+        return self._decode(buf, mask, out)
+
+    def _decode(
+        self,
+        buf: Buffer,
+        mask: None | np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: None | Buffer,
+    ) -> Buffer:
         b = numcodecs.compat.ensure_bytes(buf)
 
         b_io = BytesIO(b)
@@ -215,6 +299,13 @@ class InterpolationContextMixingCodec(Codec):
         )
 
         T, Y, X = _as_slices(shape)
+        m: np.ndarray
+        if mask is None:
+            m = np.zeros((T, Y, X), dtype=np.uint8)
+        else:
+            m = np.ascontiguousarray(
+                np.asarray(mask, dtype=np.bool).astype(np.uint8).reshape(T, Y, X)
+            )
         rec = np.zeros((T, Y, X), np.float64)
         # the range decoder may read a few bytes past the end of the stream
         inp = np.concatenate(
@@ -223,6 +314,7 @@ class InterpolationContextMixingCodec(Codec):
         dummy = np.zeros(1, np.uint8)
         _interp.code_all(
             rec,
+            m,
             rec,
             T,
             Y,

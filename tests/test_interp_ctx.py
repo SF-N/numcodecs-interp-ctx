@@ -94,3 +94,29 @@ def test_compression():
     assert size < data.size / 8
     # a finer bound needs more bits
     assert check_roundtrip(data, 0.005) > size
+
+
+def test_masked():
+    from numcodecs_mask import MaskMetaCodec
+
+    rng = np.random.default_rng(5)
+    data = smooth_field((60, 80), noise=0.05)
+    mask = rng.random(data.shape) < 0.3
+    mask[10:20, 30:50] = True
+    values = data.copy()
+    values[mask] = np.nan
+
+    codec = MaskMetaCodec(
+        mask=np.nan,
+        codec=dict(id="interp_ctx", eb=0.05),
+        bitmap_codec=dict(id="packbits"),
+    )
+    encoded = codec.encode(values)
+    decoded = np.asarray(codec.decode(encoded))
+    np.testing.assert_array_equal(np.isnan(decoded), mask)
+    assert np.all(np.abs(decoded[~mask] - data[~mask]) <= 0.05)
+
+    # a lot cheaper than coding a fill value for the masked points
+    filled = np.where(mask, 0.0, data)
+    plain = numcodecs.registry.get_codec(dict(id="interp_ctx", eb=0.05))
+    assert len(encoded) < len(plain.encode(filled))

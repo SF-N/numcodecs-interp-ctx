@@ -224,6 +224,7 @@ def _predict_interp(rec, i, j, h, along_x, Y, X, cubic):
 @njit(cache=True)
 def _code_slice(
     x,
+    m,
     rec,
     res,
     res_prev,
@@ -278,6 +279,10 @@ def _code_slice(
             ctxs[7] = levels
             ctxs[8] = (max(-15, min(15, res[i, j - S])) + 16) if j >= S else 0
             ctxs[9] = (max(-15, min(15, res[i - S, j])) + 16) if i >= S else 0
+            if m[i, j] == 1:
+                rec[i, j] = pred
+                res[i, j] = 0
+                continue
             r = int(np.rint((x[i, j] - pred) / w)) if encode else 0
             r = _code_residual(
                 r,
@@ -312,6 +317,8 @@ def _code_slice(
                 if along_x:
                     for i in range(0, Y, s):
                         for j in range(h, X, s):
+                            if m[i, j] == 1:
+                                continue
                             pc, g, c = _predict_interp(rec, i, j, h, True, Y, X, True)
                             pl, g, c = _predict_interp(rec, i, j, h, True, Y, X, False)
                             e_c += abs(x[i, j] - pc)
@@ -319,6 +326,8 @@ def _code_slice(
                 else:
                     for i in range(h, Y, s):
                         for j in range(0, X, h):
+                            if m[i, j] == 1:
+                                continue
                             pc, g, c = _predict_interp(rec, i, j, h, False, Y, X, True)
                             pl, g, c = _predict_interp(rec, i, j, h, False, Y, X, False)
                             e_c += abs(x[i, j] - pc)
@@ -371,6 +380,10 @@ def _code_slice(
                     ctxs[7] = pb
                     ctxs[8] = max(-15, min(15, eL)) + 16
                     ctxs[9] = max(-15, min(15, eU)) + 16
+                    if m[i, j] == 1:
+                        rec[i, j] = pred
+                        res[i, j] = 0
+                        continue
                     r = int(np.rint((x[i, j] - pred) / w)) if encode else 0
                     r = _code_residual(
                         r,
@@ -394,8 +407,10 @@ def _code_slice(
 
 
 @njit(cache=True)
-def code_all(x, rec, T, Y, X, w, levels, out, inp, encode, lr, lim):
-    """Encode `x` into `out` (returns the length) or decode `inp` into `rec`."""
+def code_all(x, m, rec, T, Y, X, w, levels, out, inp, encode, lr, lim):
+    """Encode `x` into `out` (returns the length) or decode `inp` into `rec`;
+    positions where the uint8 mask `m` is 1 are not coded (they take the
+    prediction)."""
     tsize = 1 << TABLE_BITS
     tmask = tsize - 1
     probs = np.full((NMODELS, tsize), MODEL_ONE // 2, np.int32)
@@ -414,6 +429,7 @@ def code_all(x, rec, T, Y, X, w, levels, out, inp, encode, lr, lim):
     for t in range(T):
         _code_slice(
             x[t],
+            m[t],
             rec[t],
             res,
             res_prev,
